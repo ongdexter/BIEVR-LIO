@@ -20,6 +20,7 @@
 #include <string>
 #include <typeinfo>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "bievr_lio/common.h"
 #include "bievr_lio/log++.h"
@@ -45,8 +46,23 @@ class PublisherBase {
   template <typename T>
   bool publish(const T& data, const Header& header, const std::string& topic,
                const std::string& child_frame = "") {
+    if (disabled_topics_.count(topic)) return true;
     return publishImpl(data, header, topic, child_frame);
   }
+
+  // Report odometry for `frame` (e.g. base_link) instead of the IMU. T_B_I is
+  // the IMU pose in that frame. The odometry origin is moved with it, so the
+  // output is the motion of `frame` starting from the identity, like a LIO run
+  // directly in that frame: T_O_B = T_B_I * T_W_I * T_B_I^-1.
+  void setOutputFrame(const std::string& frame, const Transform& T_B_I) {
+    output_frame_ = frame;
+    T_B_I_ = T_B_I;
+  }
+
+  void setPublishTf(bool publish_tf) { publish_tf_ = publish_tf; }
+
+  // Pipeline topics (e.g. "points/registered") that should not be published.
+  void disableTopic(const std::string& topic) { disabled_topics_.insert(topic); }
 
  private:
   // Pointcloud and IntensityPointcloud both go out as PointCloud2.
@@ -75,19 +91,33 @@ class PublisherBase {
     typename Backend::Odometry odom_msg;
     if (!getOrAdvertise<typename Backend::Odometry>(topic)) return false;
     headerToMsg(header, odom_msg.header);
-    odom_msg.child_frame_id = child_frame;
-    transformToMsg(odometry.pose, odom_msg.pose.pose);
+    Transform pose = odometry.pose;
+    V3 v = odometry.linear_velocity, w = odometry.angular_velocity;
+    if (output_frame_.empty()) {
+      odom_msg.child_frame_id = child_frame;
+    } else {
+      odom_msg.child_frame_id = output_frame_;
+      pose = Transform(T_B_I_ * odometry.pose * T_B_I_.inverse());
+      // Body-frame twist of B: v_B = R_BI (v_I + w_I x p_IB), w_B = R_BI w_I,
+      // with p_IB the origin of B in the IMU frame.
+      const V3 p_IB = T_B_I_.inverse().translation();
+      v = T_B_I_.linear() * (v + w.cross(p_IB));
+      w = T_B_I_.linear() * w;
+    }
+    transformToMsg(pose, odom_msg.pose.pose);
     // Twist is expressed in the child (body) frame.
-    vecToMsg(odometry.linear_velocity, odom_msg.twist.twist.linear);
-    vecToMsg(odometry.angular_velocity, odom_msg.twist.twist.angular);
+    vecToMsg(v, odom_msg.twist.twist.linear);
+    vecToMsg(w, odom_msg.twist.twist.angular);
     publishers_[topic].publish(odom_msg);
 
-    // Mirror the pose as a TF transform.
-    typename Backend::TransformStamped transform_msg;
-    transform_msg.header = odom_msg.header;
-    transform_msg.child_frame_id = child_frame;
-    transformToMsg(odometry.pose, transform_msg.transform);
-    backend_.sendTransform(transform_msg);
+    if (publish_tf_) {
+      // Mirror the pose as a TF transform.
+      typename Backend::TransformStamped transform_msg;
+      transform_msg.header = odom_msg.header;
+      transform_msg.child_frame_id = odom_msg.child_frame_id;
+      transformToMsg(pose, transform_msg.transform);
+      backend_.sendTransform(transform_msg);
+    }
     return true;
   }
 
@@ -137,6 +167,10 @@ class PublisherBase {
 
   Backend backend_;
   std::string ns_;
+  std::string output_frame_;
+  Transform T_B_I_;
+  bool publish_tf_ = true;
+  std::unordered_set<std::string> disabled_topics_;
   std::unordered_map<std::string, typename Backend::TypedPublisher> publishers_;
 };
 

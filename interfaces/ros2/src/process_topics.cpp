@@ -11,6 +11,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <string>
+#include <vector>
 
 #include "bievr_lio/config_loader.h"
 #include "bievr_lio_ros2/publisher.h"
@@ -42,7 +43,29 @@ int main(int argc, char** argv) {
 
   auto pipeline = std::make_shared<bievr::Pipeline>(config.pipeline_config);
   auto synchronizer = std::make_shared<bievr::Synchronizer>(pipeline);
-  auto lio_pub = std::make_shared<bievr::Publisher>(node, pipeline, "bievr_lio");
+  // Output options (ROS parameters; defaults keep upstream behaviour).
+  const std::string topic_ns = node->declare_parameter<std::string>("topic_namespace", "bievr_lio");
+  const std::string base_frame = node->declare_parameter<std::string>("base_frame", "");
+  // IMU pose in base_frame: [x, y, z, qx, qy, qz, qw].
+  const auto base_to_imu = node->declare_parameter<std::vector<double>>(
+      "base_to_imu", std::vector<double>{0., 0., 0., 0., 0., 0., 1.});
+  const bool publish_tf = node->declare_parameter<bool>("publish_tf", true);
+  const bool publish_registered = node->declare_parameter<bool>("publish_registered_cloud", true);
+
+  auto lio_pub = std::make_shared<bievr::Publisher>(node, pipeline, topic_ns);
+  lio_pub->setPublishTf(publish_tf);
+  if (!publish_registered) lio_pub->disableTopic("points/registered");
+  if (!base_frame.empty()) {
+    if (base_to_imu.size() != 7) {
+      LOG(E, "base_to_imu must be [x, y, z, qx, qy, qz, qw].");
+      return -1;
+    }
+    const bievr::Quaternion q(base_to_imu[6], base_to_imu[3], base_to_imu[4], base_to_imu[5]);
+    lio_pub->setOutputFrame(base_frame,
+                            bievr::Transform(bievr::V3(base_to_imu[0], base_to_imu[1], base_to_imu[2]),
+                                             q.normalized()));
+    LOG(I, "Publishing odometry for frame '" << base_frame << "'.");
+  }
 
   // ROS2 has no ShapeShifter: discover the pointcloud topic's type from the
   // graph, then use a generic (serialized) subscription to handle whichever of
